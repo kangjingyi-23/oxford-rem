@@ -1,0 +1,744 @@
+---
+title: "Oxford Two-Mode Policy Lifecycle REM Diagnostic"
+author: "Jingyi Kang"
+date: "June 2026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+  pdf_document:
+    toc: true
+    toc_depth: 3
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+required_packages <- c(
+  "data.table", "dplyr", "tidyr", "readr", "haven",
+  "lubridate", "knitr"
+)
+
+for (pkg in required_packages) {
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}
+
+find_project_root <- function() {
+  input_file <- tryCatch(knitr::current_input(), error = function(e) NULL)
+  input_dir <- if (!is.null(input_file) && nzchar(input_file) && file.exists(input_file)) {
+    dirname(normalizePath(input_file, mustWork = TRUE))
+  } else {
+    normalizePath(getwd(), mustWork = TRUE)
+  }
+
+  candidates <- unique(normalizePath(c(
+    input_dir,
+    getwd(),
+    file.path(getwd(), "phd_work_rem_project"),
+    dirname(getwd())
+  ), mustWork = FALSE))
+
+  for (candidate in candidates) {
+    if (
+      file.exists(file.path(candidate, "phd_work_rem_project.Rproj")) &&
+        dir.exists(file.path(candidate, "data_raw", "oxford"))
+    ) {
+      return(normalizePath(candidate, mustWork = TRUE))
+    }
+  }
+
+  stop("Could not locate phd_work_rem_project.Rproj and data_raw/oxford.")
+}
+
+project_root <- find_project_root()
+knitr::opts_knit$set(root.dir = project_root)
+path <- function(...) file.path(project_root, ...)
+
+dir.create(path("derived"), showWarnings = FALSE, recursive = TRUE)
+dir.create(path("outputs"), showWarnings = FALSE, recursive = TRUE)
+dir.create(path("figures"), showWarnings = FALSE, recursive = TRUE)
+
+fmt_pct <- function(x, digits = 1) paste0(round(100 * x, digits), "%")
+```
+
+# Project Check
+
+```{r project-check}
+project_check <- tibble::tibble(
+  item = c(
+    "Project root",
+    "RStudio project file exists",
+    "Oxford raw-data folder exists",
+    "Derived-output folder",
+    "Model-output folder"
+  ),
+  value = c(
+    project_root,
+    file.exists(path("phd_work_rem_project.Rproj")),
+    dir.exists(path("data_raw", "oxford")),
+    path("derived"),
+    path("outputs")
+  )
+)
+
+project_check |>
+  knitr::kable()
+```
+
+# Purpose
+
+This document focuses on one model track only: a REM-like event diagnostic for
+policy lifecycle transitions in a two-mode country-policy process.
+
+The two modes are:
+
+- countries;
+- policy indicators.
+
+The event is a state transition in a country-policy pair:
+
+$$
+e_m = (country_i, policy_p, transition_r, time_t).
+$$
+
+The purpose is not to claim a final causal diffusion design. The purpose is to
+test a narrower methodological question:
+
+> Do transition-specific risk sets and eligibility-aligned peer exposure
+> denominators change the interpretation of policy diffusion event models?
+
+# Scope For This Sprint
+
+This file estimates one part only: the event-based lifecycle diagnostic. A
+snapshot-based network model would require a separate aggregation decision, so
+it is not mixed into this script.
+
+The immediate aim is to make the event definitions, risk sets, exposure
+denominators, and missing-data choices explicit enough to discuss and revise.
+
+# Raw Data
+
+The Oxford/OxCGRT data were copied into this project under `data_raw/`. These
+raw files should be treated as read-only. All derived data and outputs are
+written to `derived/` and `outputs/`.
+
+```{r raw-data-status}
+oxford_files <- file.path(
+  path("data_raw", "oxford"),
+  paste0("OxCGRT_fullwithnotes_national_", 2020:2022, "_v1.csv")
+)
+
+cepii_file <- path("data_raw", "covariates", "dist_cepii.dta")
+
+raw_status <- tibble::tibble(
+  file = c(oxford_files, cepii_file),
+  exists = file.exists(file),
+  writable = file.access(file, 2) == 0,
+  size_mb = round(file.info(file)$size / 1024^2, 1)
+)
+
+raw_status |>
+  mutate(file = basename(file)) |>
+  knitr::kable()
+```
+
+# Missing-Data And Coding Decisions
+
+The missing-data strategy is part of the model definition because it affects
+which country-policy-days can enter a transition risk set.
+
+```{r missing-data-decisions}
+missing_strategy <- tibble::tribble(
+  ~decision_point, ~current_default, ~reason, ~sensitivity_needed,
+  "Current policy value is missing",
+  "Exclude from transition-event coding for that day.",
+  "Missing is not the same as policy absence.",
+  "Check whether missingness is concentrated in particular countries, indicators, or periods.",
+  "Previous policy value is missing",
+  "Treat as left-censored stock; do not code as ordinary adoption.",
+  "The first observed positive value may reflect a policy already in force before the observation window.",
+  "Run a sensitivity check where first observed positive values are counted as adoption.",
+  "Current value is zero after a positive previous value",
+  "Code as termination.",
+  "The policy moves from active to inactive.",
+  "Check whether zero sometimes means unreported rather than inactive.",
+  "Current value decreases but remains positive",
+  "Code as relaxation.",
+  "The policy remains active but becomes less intense.",
+  "Check whether ordinal steps are comparable across indicators.",
+  "Peer exposure denominator",
+  "Use both naive peer exposure and eligibility-aligned peer exposure.",
+  "Peers that could not experience the same transition should not necessarily enter the denominator.",
+  "Compare coefficient interpretation across the two exposure definitions."
+)
+
+missing_strategy |>
+  knitr::kable()
+```
+
+Current default:
+
+1. Do not recode missing policy values as zero.
+2. Require both current and previous policy values to be observed for transition
+   modelling.
+3. Treat first observed positive values as left-censored initial stock, not as
+   ordinary adoption.
+4. Report a later sensitivity check that counts first observed positive values
+   as adoption.
+
+# Policy Indicators
+
+```{r policy-indicators}
+indicator_domains <- c(
+  "C1E_School closing" = "Containment",
+  "C2E_Workplace closing" = "Containment",
+  "C3E_Cancel public events" = "Containment",
+  "C4E_Restrictions on gatherings" = "Containment",
+  "C5E_Close public transport" = "Containment",
+  "C6E_Stay at home requirements" = "Containment",
+  "C7E_Restrictions on internal movement" = "Containment",
+  "C8E_International travel controls" = "Containment",
+  "E1_Income support" = "Economic",
+  "E2_Debt/contract relief" = "Economic",
+  "H1_Public information campaigns" = "Health",
+  "H2_Testing policy" = "Health",
+  "H3_Contact tracing" = "Health",
+  "H6E_Facial Coverings" = "Health",
+  "H7_Vaccination policy" = "Health",
+  "H8E_Protection of elderly people" = "Health",
+  "V1_Vaccine Prioritisation (summary)" = "Vaccine",
+  "V2A_Vaccine Availability (summary)" = "Vaccine",
+  "V3_Vaccine Financial Support (summary)" = "Vaccine",
+  "V4_Mandatory Vaccination (summary)" = "Vaccine"
+)
+
+tibble::tibble(
+  policy = names(indicator_domains),
+  domain = unname(indicator_domains)
+) |>
+  knitr::kable()
+```
+
+# Build Two-Mode Country-Policy-Day Panel
+
+```{r load-and-build-panel}
+read_oxford_year <- function(file) {
+  available <- names(data.table::fread(file, nrows = 0))
+  wanted <- c(
+    "CountryName", "CountryCode", "Jurisdiction", "Date",
+    "ConfirmedCases", "ConfirmedDeaths",
+    names(indicator_domains)
+  )
+  keep <- intersect(wanted, available)
+  dt <- data.table::fread(file, select = keep, showProgress = FALSE)
+  for (missing_col in setdiff(wanted, names(dt))) {
+    dt[, (missing_col) := NA]
+  }
+  dt[, source_file := basename(file)]
+  dt[]
+}
+
+ox_raw <- data.table::rbindlist(lapply(oxford_files, read_oxford_year), fill = TRUE)
+ox_raw <- ox_raw[Jurisdiction == "NAT_TOTAL"]
+ox_raw[, Date := lubridate::ymd(as.character(Date))]
+
+long <- data.table::melt(
+  ox_raw,
+  id.vars = c("CountryName", "CountryCode", "Date", "ConfirmedCases", "ConfirmedDeaths"),
+  measure.vars = names(indicator_domains),
+  variable.name = "policy",
+  value.name = "policy_value"
+)
+
+long[, policy_value := suppressWarnings(as.numeric(policy_value))]
+long[, domain := unname(indicator_domains[as.character(policy)])]
+data.table::setorder(long, CountryCode, policy, Date)
+
+long[, current_observed := !is.na(policy_value)]
+long[, previous_value := data.table::shift(policy_value), by = .(CountryCode, policy)]
+long[, previous_observed := !is.na(previous_value)]
+long[, previous_row_exists := seq_len(.N) > 1L, by = .(CountryCode, policy)]
+long[, previous_missing_due_first_row := !previous_row_exists]
+long[, previous_missing_due_prior_missing := previous_row_exists & !previous_observed]
+long[, policy_max_observed := max(policy_value, na.rm = TRUE), by = policy]
+long[!is.finite(policy_max_observed), policy_max_observed := NA_real_]
+long[, active := as.integer(current_observed & policy_value > 0)]
+long[, previous_active := as.integer(previous_observed & previous_value > 0)]
+
+long[, event_type := data.table::fcase(
+  current_observed & previous_observed & previous_value == 0 & policy_value > 0,
+  "adoption",
+  current_observed & previous_observed & previous_value > 0 & policy_value > previous_value,
+  "strengthening",
+  current_observed & previous_observed & previous_value > 0 & policy_value < previous_value & policy_value > 0,
+  "relaxation",
+  current_observed & previous_observed & previous_value > 0 & policy_value == 0,
+  "termination",
+  current_observed & previous_observed,
+  "persistence",
+  current_observed & !previous_observed & policy_value > 0,
+  "left_censored_initial_stock",
+  current_observed & !previous_observed & policy_value == 0,
+  "initial_absence",
+  default = "missing_current"
+)]
+
+long[, reduction := as.integer(event_type %in% c("relaxation", "termination"))]
+long[, risk_adoption := current_observed & previous_observed & previous_value == 0]
+long[, risk_strengthening := current_observed & previous_observed & previous_value > 0 & previous_value < policy_max_observed]
+long[, risk_reduction := current_observed & previous_observed & previous_value > 0]
+long[, model_observed_lag := current_observed & previous_observed]
+long[, month := format(Date, "%Y-%m")]
+
+readr::write_csv(as.data.frame(long), path("derived", "country_policy_day_panel.csv"))
+
+panel_summary <- tibble::tibble(
+  countries = dplyr::n_distinct(long$CountryCode),
+  policies = dplyr::n_distinct(long$policy),
+  country_policy_days = nrow(long),
+  observed_lagged_rows = sum(long$model_observed_lag),
+  left_censored_initial_stock = sum(long$event_type == "left_censored_initial_stock"),
+  missing_current_rows = sum(long$event_type == "missing_current")
+)
+
+panel_summary |>
+  knitr::kable()
+```
+
+# Missing-Data Frequency Check
+
+This check separates three issues that should not be mixed together:
+
+1. current policy values that are missing;
+2. lagged values that are missing only because the row is the first observation
+   for that country-policy pair;
+3. lagged values that are missing because the previous recorded value was
+   missing.
+
+```{r missing-frequency-check}
+missing_overall <- tibble::tibble(
+  measure = c(
+    "Country-policy-days",
+    "Current policy value missing",
+    "Previous value missing: first row only",
+    "Previous value missing: prior recorded value missing",
+    "First observed positive value",
+    "Rows usable for lagged transition modelling"
+  ),
+  count = c(
+    nrow(long),
+    sum(!long$current_observed),
+    sum(long$previous_missing_due_first_row),
+    sum(long$previous_missing_due_prior_missing),
+    sum(long$event_type == "left_censored_initial_stock"),
+    sum(long$model_observed_lag)
+  ),
+  percent_of_country_policy_days = c(
+    1,
+    mean(!long$current_observed),
+    mean(long$previous_missing_due_first_row),
+    mean(long$previous_missing_due_prior_missing),
+    mean(long$event_type == "left_censored_initial_stock"),
+    mean(long$model_observed_lag)
+  )
+)
+
+missing_by_domain <- long[, .(
+  rows = .N,
+  current_missing = sum(!current_observed),
+  current_missing_pct = mean(!current_observed),
+  prior_value_missing = sum(previous_missing_due_prior_missing),
+  prior_value_missing_pct = mean(previous_missing_due_prior_missing),
+  first_observed_positive = sum(event_type == "left_censored_initial_stock"),
+  first_observed_positive_pct = mean(event_type == "left_censored_initial_stock"),
+  usable_lagged_rows = sum(model_observed_lag),
+  usable_lagged_rows_pct = mean(model_observed_lag)
+), by = domain][order(domain)]
+
+missing_by_policy <- long[, .(
+  rows = .N,
+  current_missing = sum(!current_observed),
+  current_missing_pct = mean(!current_observed),
+  prior_value_missing = sum(previous_missing_due_prior_missing),
+  prior_value_missing_pct = mean(previous_missing_due_prior_missing),
+  first_observed_positive = sum(event_type == "left_censored_initial_stock"),
+  first_observed_positive_pct = mean(event_type == "left_censored_initial_stock"),
+  usable_lagged_rows = sum(model_observed_lag),
+  usable_lagged_rows_pct = mean(model_observed_lag)
+), by = .(policy, domain)][order(-current_missing_pct, policy)]
+
+readr::write_csv(missing_overall, path("outputs", "missing_overall.csv"))
+readr::write_csv(as.data.frame(missing_by_domain), path("outputs", "missing_by_domain.csv"))
+readr::write_csv(as.data.frame(missing_by_policy), path("outputs", "missing_by_policy.csv"))
+
+missing_overall |>
+  mutate(percent_of_country_policy_days = fmt_pct(percent_of_country_policy_days, 3)) |>
+  knitr::kable()
+
+missing_by_domain |>
+  mutate(
+    current_missing_pct = fmt_pct(current_missing_pct, 3),
+    prior_value_missing_pct = fmt_pct(prior_value_missing_pct, 3),
+    first_observed_positive_pct = fmt_pct(first_observed_positive_pct, 3),
+    usable_lagged_rows_pct = fmt_pct(usable_lagged_rows_pct, 3)
+  ) |>
+  knitr::kable()
+
+missing_by_policy |>
+  mutate(
+    current_missing_pct = fmt_pct(current_missing_pct, 3),
+    prior_value_missing_pct = fmt_pct(prior_value_missing_pct, 3),
+    first_observed_positive_pct = fmt_pct(first_observed_positive_pct, 3),
+    usable_lagged_rows_pct = fmt_pct(usable_lagged_rows_pct, 3)
+  ) |>
+  knitr::kable()
+```
+
+For the current proof of concept, missing values are treated as missing rather
+than inactive policy states. The key empirical check is whether missingness is
+rare and whether it is concentrated in particular policy domains or indicators.
+
+# Event And Risk-Set Summary
+
+```{r event-risk-summary}
+event_counts <- long[
+  event_type %in% c("adoption", "strengthening", "relaxation", "termination", "left_censored_initial_stock"),
+  .(events = .N),
+  by = event_type
+][order(event_type)]
+
+risk_counts <- data.table::data.table(
+  transition = c("adoption", "strengthening", "reduction"),
+  risk_rule = c(
+    "previous value = 0",
+    "previous value > 0 and below policy-specific maximum",
+    "previous value > 0"
+  ),
+  risk_rows = c(
+    sum(long$risk_adoption, na.rm = TRUE),
+    sum(long$risk_strengthening, na.rm = TRUE),
+    sum(long$risk_reduction, na.rm = TRUE)
+  ),
+  events = c(
+    sum(long$event_type == "adoption", na.rm = TRUE),
+    sum(long$event_type == "strengthening", na.rm = TRUE),
+    sum(long$reduction == 1, na.rm = TRUE)
+  )
+)
+risk_counts[, event_rate := events / risk_rows]
+
+readr::write_csv(as.data.frame(event_counts), path("outputs", "event_counts.csv"))
+readr::write_csv(as.data.frame(risk_counts), path("outputs", "risk_counts.csv"))
+
+event_counts |>
+  knitr::kable()
+
+risk_counts |>
+  mutate(event_rate = fmt_pct(event_rate, 3)) |>
+  knitr::kable()
+```
+
+The important point is not the absolute count alone. The denominator changes
+when the event is adoption, strengthening, or reduction. A pooled model that
+treats all observed country-policy-days as equally at risk would mix different
+logical opportunities.
+
+# Peer Network
+
+The current peer network uses CEPII geography/language information:
+
+- contiguity;
+- common official language;
+- inverse log distance.
+
+This is a placeholder network for the proof of concept. It should later be
+compared with other pathways such as trade, ideology, regional organisation
+membership, or prior policy similarity.
+
+```{r peer-network}
+countries <- sort(unique(long$CountryCode))
+
+cepii <- as.data.table(haven::read_dta(cepii_file))
+cepii <- cepii[iso_o %in% countries & iso_d %in% countries & iso_o != iso_d]
+cepii[, inv_log_dist := 1 / log1p(as.numeric(dist))]
+cepii[, raw_weight := 1.5 * as.numeric(contig) + 0.75 * as.numeric(comlang_off) + inv_log_dist]
+cepii[is.na(raw_weight), raw_weight := 0]
+
+W <- matrix(0, nrow = length(countries), ncol = length(countries), dimnames = list(countries, countries))
+for (i in seq_len(nrow(cepii))) {
+  W[cepii$iso_o[i], cepii$iso_d[i]] <- cepii$raw_weight[i]
+}
+diag(W) <- 0
+row_sums <- rowSums(W)
+W[row_sums > 0, ] <- W[row_sums > 0, ] / row_sums[row_sums > 0]
+
+peer_network_summary <- tibble::tibble(
+  countries = length(countries),
+  countries_with_positive_peer_weight = sum(rowSums(W) > 0),
+  directed_positive_edges = sum(W > 0),
+  density = sum(W > 0) / (length(countries) * (length(countries) - 1))
+)
+
+readr::write_csv(as.data.frame(peer_network_summary), path("outputs", "peer_network_summary.csv"))
+peer_network_summary |>
+  knitr::kable()
+```
+
+# Exposure Construction
+
+For each country-policy-day, the focal exposure is recent peer reduction on the
+same policy indicator.
+
+Two exposure definitions are compared:
+
+1. **Naive peer reduction exposure**: weighted count of peer reduction events in
+   the previous 14 days.
+2. **Eligibility-aligned peer reduction rate**: weighted peer reduction events
+   divided by weighted peer-days that were eligible to reduce in the previous
+   14 days.
+
+```{r exposure-construction}
+rolling_lag_sum <- function(mat, window = 14) {
+  out <- matrix(0, nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+  if (nrow(mat) <= 1) return(out)
+  for (lag in seq_len(window)) {
+    if ((lag + 1) <= nrow(mat)) {
+      out[(lag + 1):nrow(mat), ] <- out[(lag + 1):nrow(mat), ] + mat[1:(nrow(mat) - lag), ]
+    }
+  }
+  out
+}
+
+all_dates <- sort(unique(long$Date))
+rem_parts <- list()
+
+for (p in names(indicator_domains)) {
+  sub <- long[as.character(policy) == p]
+  model_rows <- sub[model_observed_lag == TRUE]
+  if (nrow(model_rows) == 0) next
+
+  event_mat <- matrix(0, nrow = length(all_dates), ncol = length(countries), dimnames = list(as.character(all_dates), countries))
+  risk_mat <- matrix(0, nrow = length(all_dates), ncol = length(countries), dimnames = list(as.character(all_dates), countries))
+
+  event_rows <- sub[reduction == 1 & !is.na(Date) & CountryCode %in% countries]
+  if (nrow(event_rows) > 0) {
+    event_mat[cbind(as.character(event_rows$Date), event_rows$CountryCode)] <- 1
+  }
+
+  risk_rows <- sub[risk_reduction == TRUE & !is.na(Date) & CountryCode %in% countries]
+  if (nrow(risk_rows) > 0) {
+    risk_mat[cbind(as.character(risk_rows$Date), risk_rows$CountryCode)] <- 1
+  }
+
+  lag_event <- rolling_lag_sum(event_mat, 14)
+  lag_risk <- rolling_lag_sum(risk_mat, 14)
+
+  peer_event <- lag_event %*% t(W)
+  peer_risk <- lag_risk %*% t(W)
+
+  model_rows[, date_pos := match(as.character(Date), rownames(peer_event))]
+  model_rows[, country_pos := match(CountryCode, colnames(peer_event))]
+  idx <- cbind(model_rows$date_pos, model_rows$country_pos)
+
+  model_rows[, naive_peer_reduction_14 := as.numeric(peer_event[idx])]
+  model_rows[, eligible_peer_mass_14 := as.numeric(peer_risk[idx])]
+  model_rows[, eligible_peer_reduction_rate_14 := fifelse(
+    eligible_peer_mass_14 > 0,
+    naive_peer_reduction_14 / eligible_peer_mass_14,
+    0
+  )]
+  model_rows[, date_pos := NULL]
+  model_rows[, country_pos := NULL]
+
+  rem_parts[[p]] <- model_rows
+}
+
+rem_data <- data.table::rbindlist(rem_parts, fill = TRUE)
+rem_data[, reduction := as.integer(reduction)]
+
+readr::write_csv(as.data.frame(rem_data), path("derived", "rem_exposure_panel.csv"))
+
+exposure_summary <- rem_data[, .(
+  rows = .N,
+  reduction_events = sum(reduction),
+  mean_naive_peer_reduction_14 = mean(naive_peer_reduction_14, na.rm = TRUE),
+  mean_eligible_peer_rate_14 = mean(eligible_peer_reduction_rate_14, na.rm = TRUE),
+  mean_eligible_peer_mass_14 = mean(eligible_peer_mass_14, na.rm = TRUE)
+)]
+
+readr::write_csv(as.data.frame(exposure_summary), path("outputs", "exposure_summary.csv"))
+exposure_summary |>
+  knitr::kable(digits = 4)
+```
+
+# Model Comparison
+
+Three specifications are compared.
+
+| Model | Focal rows | Exposure |
+|---|---|---|
+| A | all observed country-policy-days after lag construction | naive peer reduction count |
+| B | only reduction-eligible country-policy-days | naive peer reduction count |
+| C | only reduction-eligible country-policy-days | eligibility-aligned peer reduction rate |
+
+The models are deliberately simple. They are diagnostic models, not final causal
+diffusion models.
+
+```{r model-comparison}
+sample_for_logit <- function(dt, event_col = "reduction", ratio = 20, seed = 20260614) {
+  set.seed(seed)
+  events <- dt[get(event_col) == 1]
+  nonevents <- dt[get(event_col) == 0]
+  n_nonevents <- min(nrow(nonevents), max(nrow(events) * ratio, 1))
+  nonevents_sample <- nonevents[sample(.N, n_nonevents)]
+  data.table::rbindlist(list(events, nonevents_sample), fill = TRUE)
+}
+
+fit_one_logit <- function(data, formula, model_name) {
+  fit <- glm(formula, data = as.data.frame(data), family = binomial())
+  co <- summary(fit)$coefficients
+  coefficients <- data.frame(
+    model = model_name,
+    term = rownames(co),
+    estimate = co[, 1],
+    std_error = co[, 2],
+    p_value = co[, 4],
+    odds_ratio = exp(co[, 1]),
+    row.names = NULL
+  )
+  summary_row <- data.frame(
+    model = model_name,
+    rows = nrow(data),
+    events = sum(data$reduction),
+    event_rate = mean(data$reduction),
+    aic = AIC(fit),
+    bic = BIC(fit)
+  )
+  list(coefficients = coefficients, summary = summary_row)
+}
+
+model_a_data <- rem_data[model_observed_lag == TRUE]
+model_b_data <- rem_data[risk_reduction == TRUE]
+model_c_data <- model_b_data
+
+model_a_sample <- sample_for_logit(model_a_data, seed = 1)
+model_b_sample <- sample_for_logit(model_b_data, seed = 2)
+model_c_sample <- sample_for_logit(model_c_data, seed = 3)
+
+model_a <- fit_one_logit(
+  model_a_sample,
+  reduction ~ previous_value + naive_peer_reduction_14 + domain + month,
+  "A_naive_denominator"
+)
+
+model_b <- fit_one_logit(
+  model_b_sample,
+  reduction ~ previous_value + naive_peer_reduction_14 + domain + month,
+  "B_state_dependent_denominator"
+)
+
+model_c <- fit_one_logit(
+  model_c_sample,
+  reduction ~ previous_value + eligible_peer_reduction_rate_14 + eligible_peer_mass_14 + domain + month,
+  "C_state_denominator_eligible_exposure"
+)
+
+model_summary <- dplyr::bind_rows(model_a$summary, model_b$summary, model_c$summary)
+model_coefficients <- dplyr::bind_rows(model_a$coefficients, model_b$coefficients, model_c$coefficients)
+
+readr::write_csv(model_summary, path("outputs", "rem_model_summary.csv"))
+readr::write_csv(model_coefficients, path("outputs", "rem_model_coefficients.csv"))
+
+model_summary |>
+  mutate(event_rate = fmt_pct(event_rate, 2), aic = round(aic, 2), bic = round(bic, 2)) |>
+  knitr::kable()
+
+model_coefficients |>
+  filter(term %in% c(
+    "naive_peer_reduction_14",
+    "eligible_peer_reduction_rate_14",
+    "eligible_peer_mass_14"
+  )) |>
+  mutate(
+    estimate = round(estimate, 4),
+    std_error = round(std_error, 4),
+    p_value = signif(p_value, 3),
+    odds_ratio = round(odds_ratio, 3)
+  ) |>
+  knitr::kable()
+```
+
+# Interpretation
+
+This comparison should be read as a diagnostic. It asks whether the model
+changes when the risk set and peer-exposure denominator are aligned with the
+focal transition.
+
+The result should not be described as proof that rollback diffuses. The current
+design still needs:
+
+1. domestic severity controls;
+2. population denominators for cases and deaths;
+3. alternative peer networks;
+4. uncertainty clustered by country and policy;
+5. a non-Covid benchmark.
+
+# Variables Or Decisions Still Needed
+
+```{r variables-needed}
+needed <- tibble::tribble(
+  ~item, ~why_it_matters, ~current_status,
+  "Population denominator",
+  "Confirmed cases/deaths should be converted to per-capita severity measures.",
+  "Not included in this first REM diagnostic.",
+  "Lagged severity controls",
+  "Needed to reduce common-shock confounding in Covid policy changes.",
+  "Oxford contains ConfirmedCases and ConfirmedDeaths; the lagged per-capita construction still needs to be agreed.",
+  "Alternative peer network",
+  "CEPII geography/language is only one possible diffusion pathway.",
+  "Need to add trade, regional organisations, ideology, policy similarity, or another defensible pathway.",
+  "Missing-value sensitivity",
+  "First observed positive values may affect adoption and stock counts.",
+  "Default is left-censoring; sensitivity check still needed.",
+  "Non-Covid benchmark",
+  "Required because Covid may be unusual.",
+  "IEA or a policy diffusion replication package should be checked next."
+)
+
+needed |>
+  knitr::kable()
+```
+
+# Six-Month Output Logic
+
+```{r six-month-plan}
+six_month_plan <- tibble::tribble(
+  ~period, ~deliverable,
+  "Month 1", "Definitive event-coding and missing-data memo; clean two-mode Oxford panel; sensitivity check for first observed positive values.",
+  "Month 2", "REM-like lifecycle diagnostic comparing naive denominator, state-dependent denominator, and eligibility-aligned exposure.",
+  "Month 3", "Improved covariates and peer network: severity controls, population denominator, and at least one non-geographic exposure network.",
+  "Month 4", "Robustness checks: alternative exposure windows, alternative missing-data coding, and clustered uncertainty.",
+  "Month 5", "Non-Covid benchmark check using IEA or a policy diffusion replication package.",
+  "Month 6", "Focused methods memo with reproducible code appendix and decision on the main methodological contribution."
+)
+
+six_month_plan |>
+  knitr::kable()
+```
+
+# Conclusion
+
+This REM-only version is the cleanest immediate proof of concept because it
+keeps the event process in daily time and directly addresses the main
+methodological issue from the report: policy lifecycle transitions require
+transition-specific risk sets.
+
+The strongest claim at this stage is:
+
+> Risk-set construction and peer-exposure denominator choices are inferential
+> choices in policy lifecycle diffusion models, not merely coding choices.
+
+The claim remains diagnostic and preliminary. It does not yet solve causal
+identification.
