@@ -1,0 +1,927 @@
+---
+title: ""
+output: html_document
+date: "2026-06-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction:
+Oxford Covid-19 Government Response Tracker (OxCGRT) 
+Covarite:
+First thing need to consider is that the scale is different here. as policy-day need covarite in a day-level, but most covarite is not day-level.
+Refer to my previously submitted, more technical plan, I select variables from several levels of the two-mode policy process: country-level attributes, time-varying country-day conditions, policy-level attributes, and dyadic peer relations. Country-level variables such as GDP per capita, population, democracy score, and government effectiveness capture cross-national differences in capacity and political context, while time-varying Covid indicators such as cases, deaths, and vaccination rates capture changing pandemic pressure. Policy domain captures differences across policy types, and dyadic variables such as distance, contiguity, common language, and similarity measures are used to construct peer exposure between countries.
+
+# Packages and project paths 
+
+```{r packages installation, message=FALSE, warning=FALSE}
+## Packages required for this project
+
+required_packages <- c(
+  "data.table",
+  "dplyr",
+  "readr",
+  "haven",
+  "lubridate",
+  "knitr",
+  "tidyr"
+)
+
+## Install packages if needed
+
+new_packages <- required_packages[
+  !(required_packages %in% installed.packages()[, "Package"])
+]
+
+if (length(new_packages) > 0) {
+  install.packages(new_packages)
+}
+
+## Load packages
+
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+## Project paths
+
+project_root <- dirname(getwd())
+
+path <- function(...) file.path(project_root, ...)
+
+raw_d <- path("raw data")
+oxford_d <- file.path(raw_d, "oxford")
+covariate_d <- file.path(raw_d, "covariates")
+
+
+```
+
+# read and select data 
+
+```{r read-and-select-data, message=FALSE, warning=FALSE}
+
+## read Oxford raw data first
+oxford_2020_raw <- readr::read_csv(
+  file.path(oxford_d, "OxCGRT_fullwithnotes_national_2020_v1.csv"),
+  show_col_types = FALSE
+)
+
+oxford_2021_raw <- readr::read_csv(
+  file.path(oxford_d, "OxCGRT_fullwithnotes_national_2021_v1.csv"),
+  show_col_types = FALSE
+)
+
+oxford_2022_raw <- readr::read_csv(
+  file.path(oxford_d, "OxCGRT_fullwithnotes_national_2022_v1.csv"),
+  show_col_types = FALSE
+)
+
+oxford_raw <- dplyr::bind_rows(
+  oxford_2020_raw,
+  oxford_2021_raw,
+  oxford_2022_raw
+)
+## keep only national-level data
+oxford_raw <- oxford_raw |>
+  dplyr::filter(Jurisdiction == "NAT_TOTAL")
+## select the data and change the name
+
+## I check the summary here, some of them are totally missing. SO some Oxford columns are not used in the first version.  RegionName and RegionCode are empty because this is the national-level file. NV and V policy columns refer to rules differentiated by vaccination status;  they are often missing and are not part of the baseline model. Notes columns are also mostly missing because notes are only recorded when needed.
+oxford_selected <- oxford_raw |>
+  dplyr::filter(Jurisdiction == "NAT_TOTAL") |>
+  dplyr::select(
+    country_name = CountryName,
+    country_code = CountryCode,
+    date = Date,
+    confirmed_cases = ConfirmedCases,
+    confirmed_deaths = ConfirmedDeaths,
+
+    c1_school_closing = `C1M_School closing`,
+    c2_workplace_closing = `C2M_Workplace closing`,
+    c3_cancel_public_events = `C3M_Cancel public events`,
+    c4_restrictions_on_gatherings = `C4M_Restrictions on gatherings`,
+    c5_close_public_transport = `C5M_Close public transport`,
+    c6_stay_at_home = `C6M_Stay at home requirements`,
+    c7_internal_movement = `C7M_Restrictions on internal movement`,
+    c8_international_travel = `C8E_International travel controls`,
+
+    e1_income_support = `E1_Income support`,
+    e2_debt_contract_relief = `E2_Debt/contract relief`,
+
+    h1_public_information = `H1_Public information campaigns`,
+    h2_testing_policy = `H2_Testing policy`,
+    h3_contact_tracing = `H3_Contact tracing`,
+    h6_facial_coverings = `H6M_Facial Coverings`,
+    h7_vaccination_policy = `H7_Vaccination policy`,
+    h8_elderly_protection = `H8M_Protection of elderly people`,
+
+    v1_vaccine_prioritisation = `V1_Vaccine Prioritisation (summary)`,
+    v2a_vaccine_availability = `V2A_Vaccine Availability (summary)`,
+    v3_vaccine_financial_support = `V3_Vaccine Financial Support (summary)`,
+    v4_mandatory_vaccination = `V4_Mandatory Vaccination (summary)`
+  ) |>
+  dplyr::mutate(
+    date = lubridate::ymd(as.character(date))
+  )
+## noted: lubridate
+```
+
+
+# Read covariate data
+
+```{r read-covariate-data, message=FALSE, warning=FALSE}
+
+## I use 2019 values as pre-pandemic country-level covariates. These include GDP per capita, population, government effectiveness, and democracy.
+
+wdi_d <- file.path(covariate_d, "world_bank_wdi")
+wgi_d <- file.path(covariate_d, "world_bank_wgi")
+vdem_d <- file.path(covariate_d, "vdem")
+owid_d <- file.path(covariate_d, "owid_covid")
+
+## GDP per capita from World Bank WDI
+
+gdp_file <- file.path(
+  wdi_d,
+  "NY.GDP.PCAP.CD_csv_extracted",
+  "API_NY.GDP.PCAP.CD_DS2_en_csv_v2_358064.csv"
+)
+
+gdp_raw <- readr::read_csv(
+  gdp_file,
+  skip = 4,
+  show_col_types = FALSE
+)
+
+gdp_selected <- gdp_raw |>
+  dplyr::select(
+    country_name = `Country Name`,
+    country_code = `Country Code`,
+    gdp_per_capita_2019 = `2019`
+  )
+
+## Population from World Bank WDI
+
+population_file <- file.path(
+  wdi_d,
+  "SP.POP.TOTL_csv_extracted",
+  "API_SP.POP.TOTL_DS2_en_csv_v2_346039.csv"
+)
+
+population_raw <- readr::read_csv(
+  population_file,
+  skip = 4,
+  show_col_types = FALSE
+)
+
+population_selected <- population_raw |>
+  dplyr::select(
+    country_name = `Country Name`,
+    country_code = `Country Code`,
+    population_2019 = `2019`
+  )
+
+## Government effectiveness from World Bank WGI
+
+government_effectiveness_file <- file.path(
+  wgi_d,
+  "GE.EST_csv_extracted",
+  "API_GE.EST_DS57_en_csv_v2_283047.csv"
+)
+
+government_effectiveness_raw <- readr::read_csv(
+  government_effectiveness_file,
+  skip = 4,
+  show_col_types = FALSE
+)
+
+government_effectiveness_selected <- government_effectiveness_raw |>
+  dplyr::select(
+    country_name = `Country Name`,
+    country_code = `Country Code`,
+    government_effectiveness_2019 = `2019`
+  )
+
+## Democracy measure from V-Dem
+## V-Dem is not a normal csv file here.
+## I extract the main country-year data object from the downloaded archive first.
+
+vdem_file <- file.path(
+  vdem_d,
+  "vdemdata_16.0.tar.gz"
+)
+
+vdem_temp_d <- tempfile()
+dir.create(vdem_temp_d)
+
+utils::untar(
+  vdem_file,
+  files = "vdemdata/data/vdem.RData",
+  exdir = vdem_temp_d
+)
+
+vdem_env <- new.env()
+load(
+  file.path(vdem_temp_d, "vdemdata", "data", "vdem.RData"),
+  envir = vdem_env
+)
+
+vdem_raw <- vdem_env$vdem
+
+democracy_selected <- vdem_raw |>
+  dplyr::filter(year == 2019) |>
+  dplyr::select(
+    country_name,
+    country_code = country_text_id,
+    democracy_polyarchy_2019 = v2x_polyarchy
+  )
+
+## Time-varying Covid covariates from OWID
+
+owid_file <- file.path(
+  owid_d,
+  "owid-covid-data.csv"
+)
+
+owid_raw <- readr::read_csv(
+  owid_file,
+  show_col_types = FALSE
+)
+
+owid_selected <- owid_raw |>
+  dplyr::select(
+    country_name = location,
+    country_code = iso_code,
+    date,
+    new_cases_smoothed_per_million,
+    new_deaths_smoothed_per_million,
+    people_vaccinated_per_hundred,
+    people_fully_vaccinated_per_hundred,
+    total_boosters_per_hundred
+  ) |>
+  dplyr::mutate(
+    date = lubridate::ymd(date)
+  )
+
+## Dyadic country-country covariates from CEPII
+
+cepii_file <- file.path(
+  covariate_d,
+  "dist_cepii.dta"
+)
+
+cepii_raw <- haven::read_dta(cepii_file)
+
+cepii_selected <- cepii_raw |>
+  dplyr::select(
+    country_origin = iso_o,
+    country_destination = iso_d,
+    distance = dist,
+    contiguity = contig,
+    common_official_language = comlang_off
+  )
+
+```
+
+# Missing data check
+
+```{r missing-data, message=FALSE, warning=FALSE}
+
+## I first check missing values, but I do not impute anything yet.
+## The imputation or deletion strategy should be decided after seeing the pattern.
+
+## Missing values in the selected Oxford data
+
+oxford_missing_check <- data.frame(
+  variable = names(oxford_selected),
+  missing_count = sapply(oxford_selected, function(x) sum(is.na(x))),
+  missing_rate = sapply(oxford_selected, function(x) mean(is.na(x)))
+)
+
+oxford_missing_check <- oxford_missing_check |>
+  dplyr::mutate(
+    missing_percent = round(missing_rate * 100, 2)
+  ) |>
+  dplyr::arrange(
+    dplyr::desc(missing_rate)
+  )
+
+knitr::kable(oxford_missing_check)
+
+
+## Missing values in policy variables only
+## These variables are important because they will define the policy events.
+
+policy_variables <- c(
+  "c1_school_closing",
+  "c2_workplace_closing",
+  "c3_cancel_public_events",
+  "c4_restrictions_on_gatherings",
+  "c5_close_public_transport",
+  "c6_stay_at_home",
+  "c7_internal_movement",
+  "c8_international_travel",
+  "e1_income_support",
+  "e2_debt_contract_relief",
+  "h1_public_information",
+  "h2_testing_policy",
+  "h3_contact_tracing",
+  "h6_facial_coverings",
+  "h7_vaccination_policy",
+  "h8_elderly_protection",
+  "v1_vaccine_prioritisation",
+  "v2a_vaccine_availability",
+  "v3_vaccine_financial_support",
+  "v4_mandatory_vaccination"
+)
+
+policy_missing_check <- data.frame(
+  variable = policy_variables,
+  missing_count = sapply(oxford_selected[policy_variables], function(x) sum(is.na(x))),
+  missing_rate = sapply(oxford_selected[policy_variables], function(x) mean(is.na(x)))
+)
+
+policy_missing_check <- policy_missing_check |>
+  dplyr::mutate(
+    missing_percent = round(missing_rate * 100, 2)
+  ) |>
+  dplyr::arrange(
+    dplyr::desc(missing_rate)
+  )
+
+knitr::kable(policy_missing_check)
+
+
+## Missing values in country-level covariates
+## I check them only for countries that appear in the Oxford data.
+
+oxford_countries <- oxford_selected |>
+  dplyr::distinct(
+    country_code,
+    country_name
+  )
+
+country_covariates_selected <- oxford_countries |>
+  dplyr::left_join(
+    gdp_selected |>
+      dplyr::select(country_code, gdp_per_capita_2019),
+    by = "country_code"
+  ) |>
+  dplyr::left_join(
+    population_selected |>
+      dplyr::select(country_code, population_2019),
+    by = "country_code"
+  ) |>
+  dplyr::left_join(
+    government_effectiveness_selected |>
+      dplyr::select(country_code, government_effectiveness_2019),
+    by = "country_code"
+  ) |>
+  dplyr::left_join(
+    democracy_selected |>
+      dplyr::select(country_code, democracy_polyarchy_2019),
+    by = "country_code"
+  )
+
+country_covariate_missing_check <- data.frame(
+  variable = names(country_covariates_selected),
+  missing_count = sapply(country_covariates_selected, function(x) sum(is.na(x))),
+  missing_rate = sapply(country_covariates_selected, function(x) mean(is.na(x)))
+)
+
+country_covariate_missing_check <- country_covariate_missing_check |>
+  dplyr::mutate(
+    missing_percent = round(missing_rate * 100, 2)
+  ) |>
+  dplyr::arrange(
+    dplyr::desc(missing_rate)
+  )
+
+knitr::kable(country_covariate_missing_check)
+
+
+## Missing values in time-varying Covid covariates
+## Vaccination variables may be missing in early 2020 because vaccination was not available yet.
+
+owid_2020_2022 <- owid_selected |>
+  dplyr::filter(
+    date >= lubridate::ymd("2020-01-01"),
+    date <= lubridate::ymd("2022-12-31")
+  )
+
+owid_missing_check <- data.frame(
+  variable = names(owid_2020_2022),
+  missing_count = sapply(owid_2020_2022, function(x) sum(is.na(x))),
+  missing_rate = sapply(owid_2020_2022, function(x) mean(is.na(x)))
+)
+
+owid_missing_check <- owid_missing_check |>
+  dplyr::mutate(
+    missing_percent = round(missing_rate * 100, 2)
+  ) |>
+  dplyr::arrange(
+    dplyr::desc(missing_rate)
+  )
+
+knitr::kable(owid_missing_check)
+
+```
+
+The missing-data check is useful for deciding which observations can enter the
+event risk set. In this first check, most selected Oxford policy variables have
+no missing values, but `v4_mandatory_vaccination` and `c8_international_travel`
+have clear missingness. I do not treat these missing values as policy absence.
+Instead, if either the current policy value or the previous policy value is
+missing, that country-policy-day cannot be used to define a transition event.
+
+This is why the next step is not imputation. The next step is to reshape the
+data into a two-mode country-policy-day format and then define which rows are
+observable and eligible for each type of transition. This makes the script more
+like a proof of concept: it shows whether the event structure and risk sets can
+be constructed clearly before estimating a full model.
+
+# Build two-mode country-policy-day data
+
+```{r build-two-mode-data, message=FALSE, warning=FALSE}
+
+## The original Oxford data are country-day data.
+## Each policy is stored as a separate column.
+## For this project, I change the data into country-policy-day data.
+
+policy_information <- data.frame(
+  policy = policy_variables,
+  policy_domain = c(
+    rep("Containment", 8),
+    rep("Economic", 2),
+    rep("Health", 6),
+    rep("Vaccine", 4)
+  )
+)
+
+policy_long_list <- list()
+
+for (this_policy in policy_variables) {
+  this_policy_data <- oxford_selected |>
+    dplyr::select(
+      country_name,
+      country_code,
+      date,
+      confirmed_cases,
+      confirmed_deaths,
+      dplyr::all_of(this_policy)
+    )
+
+  names(this_policy_data)[names(this_policy_data) == this_policy] <- "policy_value"
+
+  this_policy_data$policy <- this_policy
+  this_policy_data$policy_domain <- policy_information$policy_domain[
+    policy_information$policy == this_policy
+  ]
+
+  policy_long_list[[this_policy]] <- this_policy_data
+}
+
+oxford_two_mode <- dplyr::bind_rows(policy_long_list)
+
+oxford_two_mode <- oxford_two_mode |>
+  dplyr::arrange(
+    country_code,
+    policy,
+    date
+  )
+
+two_mode_check <- oxford_two_mode |>
+  dplyr::summarise(
+    countries = dplyr::n_distinct(country_code),
+    policies = dplyr::n_distinct(policy),
+    days = dplyr::n_distinct(date),
+    country_policy_days = dplyr::n()
+  )
+
+knitr::kable(two_mode_check)
+
+```
+
+# Define transition risk sets
+
+```{r define-transition-risk-sets, message=FALSE, warning=FALSE}
+
+## I write this part in a matrix style, following the logic from practical 5.
+## For each policy, I create a country-by-day matrix.
+## Then I compare yesterday's value and today's value.
+
+countries <- sort(unique(oxford_two_mode$country_code))
+dates <- sort(unique(oxford_two_mode$date))
+
+risk_result_list <- list()
+
+for (this_policy in policy_variables) {
+
+  ## Take one policy at a time.
+
+  one_policy_data <- oxford_two_mode |>
+    dplyr::filter(policy == this_policy)
+
+  ## Create an empty matrix.
+  ## Rows are countries and columns are dates.
+
+  policy_matrix <- matrix(
+    NA,
+    nrow = length(countries),
+    ncol = length(dates)
+  )
+
+  rownames(policy_matrix) <- countries
+  colnames(policy_matrix) <- as.character(dates)
+
+  ## Fill the matrix with observed policy values.
+
+  for (i in 1:nrow(one_policy_data)) {
+    this_country <- one_policy_data$country_code[i]
+    this_date <- as.character(one_policy_data$date[i])
+    this_value <- one_policy_data$policy_value[i]
+
+    policy_matrix[this_country, this_date] <- this_value
+  }
+
+  ## Create empty matrices to store previous values, risk sets, and event types.
+
+  previous_matrix <- matrix(
+    NA,
+    nrow = nrow(policy_matrix),
+    ncol = ncol(policy_matrix)
+  )
+
+  adoption_risk_matrix <- matrix(0, nrow = nrow(policy_matrix), ncol = ncol(policy_matrix))
+  strengthening_risk_matrix <- matrix(0, nrow = nrow(policy_matrix), ncol = ncol(policy_matrix))
+  reduction_risk_matrix <- matrix(0, nrow = nrow(policy_matrix), ncol = ncol(policy_matrix))
+
+  adoption_event_matrix <- matrix(0, nrow = nrow(policy_matrix), ncol = ncol(policy_matrix))
+  strengthening_event_matrix <- matrix(0, nrow = nrow(policy_matrix), ncol = ncol(policy_matrix))
+  relaxation_event_matrix <- matrix(0, nrow = nrow(policy_matrix), ncol = ncol(policy_matrix))
+  termination_event_matrix <- matrix(0, nrow = nrow(policy_matrix), ncol = ncol(policy_matrix))
+
+  observable_matrix <- matrix(0, nrow = nrow(policy_matrix), ncol = ncol(policy_matrix))
+
+  rownames(previous_matrix) <- countries
+  colnames(previous_matrix) <- as.character(dates)
+
+  rownames(adoption_risk_matrix) <- countries
+  colnames(adoption_risk_matrix) <- as.character(dates)
+
+  rownames(strengthening_risk_matrix) <- countries
+  colnames(strengthening_risk_matrix) <- as.character(dates)
+
+  rownames(reduction_risk_matrix) <- countries
+  colnames(reduction_risk_matrix) <- as.character(dates)
+
+  ## The first day has no previous day, so I start from the second column.
+
+  policy_max_value <- max(policy_matrix, na.rm = TRUE)
+
+  for (j in 2:ncol(policy_matrix)) {
+    previous_matrix[, j] <- policy_matrix[, j - 1]
+
+    for (i in 1:nrow(policy_matrix)) {
+      previous_value <- previous_matrix[i, j]
+      current_value <- policy_matrix[i, j]
+
+      if (!is.na(previous_value) & !is.na(current_value)) {
+        observable_matrix[i, j] <- 1
+
+        if (previous_value == 0) {
+          adoption_risk_matrix[i, j] <- 1
+        }
+
+        if (previous_value > 0 & previous_value < policy_max_value) {
+          strengthening_risk_matrix[i, j] <- 1
+        }
+
+        if (previous_value > 0) {
+          reduction_risk_matrix[i, j] <- 1
+        }
+
+        if (previous_value == 0 & current_value > 0) {
+          adoption_event_matrix[i, j] <- 1
+        }
+
+        if (previous_value > 0 & current_value > previous_value) {
+          strengthening_event_matrix[i, j] <- 1
+        }
+
+        if (previous_value > 0 & current_value < previous_value & current_value > 0) {
+          relaxation_event_matrix[i, j] <- 1
+        }
+
+        if (previous_value > 0 & current_value == 0) {
+          termination_event_matrix[i, j] <- 1
+        }
+      }
+    }
+  }
+
+  ## Change the matrices back into a data frame.
+
+  one_policy_risk_data <- expand.grid(
+    country_code = rownames(policy_matrix),
+    date = as.Date(colnames(policy_matrix))
+  )
+
+  one_policy_risk_data$policy <- this_policy
+  one_policy_risk_data$policy_domain <- policy_information$policy_domain[
+    policy_information$policy == this_policy
+  ]
+
+  one_policy_risk_data$current_value <- as.vector(policy_matrix)
+  one_policy_risk_data$previous_value <- as.vector(previous_matrix)
+  one_policy_risk_data$observable <- as.vector(observable_matrix)
+
+  one_policy_risk_data$risk_adoption <- as.vector(adoption_risk_matrix)
+  one_policy_risk_data$risk_strengthening <- as.vector(strengthening_risk_matrix)
+  one_policy_risk_data$risk_reduction <- as.vector(reduction_risk_matrix)
+
+  one_policy_risk_data$event_adoption <- as.vector(adoption_event_matrix)
+  one_policy_risk_data$event_strengthening <- as.vector(strengthening_event_matrix)
+  one_policy_risk_data$event_relaxation <- as.vector(relaxation_event_matrix)
+  one_policy_risk_data$event_termination <- as.vector(termination_event_matrix)
+
+  risk_result_list[[this_policy]] <- one_policy_risk_data
+}
+
+oxford_risk_set <- dplyr::bind_rows(risk_result_list)
+
+## Give each row one simple event label.
+
+oxford_risk_set$event_type <- "persistence_or_no_change"
+oxford_risk_set$event_type[oxford_risk_set$observable == 0] <- "not_observable"
+oxford_risk_set$event_type[oxford_risk_set$event_adoption == 1] <- "adoption"
+oxford_risk_set$event_type[oxford_risk_set$event_strengthening == 1] <- "strengthening"
+oxford_risk_set$event_type[oxford_risk_set$event_relaxation == 1] <- "relaxation"
+oxford_risk_set$event_type[oxford_risk_set$event_termination == 1] <- "termination"
+
+event_type_count <- oxford_risk_set |>
+  dplyr::count(
+    event_type,
+    name = "number_of_rows"
+  ) |>
+  dplyr::arrange(
+    dplyr::desc(number_of_rows)
+  )
+
+knitr::kable(event_type_count)
+
+risk_set_summary <- oxford_risk_set |>
+  dplyr::group_by(
+    policy,
+    policy_domain
+  ) |>
+  dplyr::summarise(
+    total_rows = dplyr::n(),
+    observable_rows = sum(observable, na.rm = TRUE),
+    adoption_risk_rows = sum(risk_adoption, na.rm = TRUE),
+    adoption_events = sum(event_adoption, na.rm = TRUE),
+    strengthening_risk_rows = sum(risk_strengthening, na.rm = TRUE),
+    strengthening_events = sum(event_strengthening, na.rm = TRUE),
+    reduction_risk_rows = sum(risk_reduction, na.rm = TRUE),
+    reduction_events = sum(event_relaxation + event_termination, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+risk_set_summary$adoption_event_rate <- risk_set_summary$adoption_events / risk_set_summary$adoption_risk_rows
+risk_set_summary$strengthening_event_rate <- risk_set_summary$strengthening_events / risk_set_summary$strengthening_risk_rows
+risk_set_summary$reduction_event_rate <- risk_set_summary$reduction_events / risk_set_summary$reduction_risk_rows
+
+knitr::kable(risk_set_summary)
+
+```
+
+The risk-set table is the first proof-of-concept output. It checks whether the
+two-mode structure produces enough observable country-policy-days and whether
+different transition types have different denominators. This matters because a
+pooled model that treats all rows as equally at risk would mix adoption,
+strengthening, relaxation, and termination even though these events are
+logically possible under different previous policy states.
+
+# Risk-set comparison as proof of concept
+
+```{r risk-set-comparison-proof-of-concept, message=FALSE, warning=FALSE}
+
+## Here I compare a naive denominator with transition-specific denominators.
+## The naive denominator treats all observable country-policy-days as the risk set.
+## The transition-specific denominator only uses rows that are logically eligible.
+
+policy_comparison <- risk_set_summary |>
+  dplyr::mutate(
+    naive_adoption_rate = adoption_events / observable_rows,
+    state_adoption_rate = adoption_events / adoption_risk_rows,
+    naive_strengthening_rate = strengthening_events / observable_rows,
+    state_strengthening_rate = strengthening_events / strengthening_risk_rows,
+    naive_reduction_rate = reduction_events / observable_rows,
+    state_reduction_rate = reduction_events / reduction_risk_rows
+  )
+
+policy_comparison_selected <- policy_comparison |>
+  dplyr::select(
+    policy,
+    policy_domain,
+    observable_rows,
+    adoption_risk_rows,
+    adoption_events,
+    naive_adoption_rate,
+    state_adoption_rate,
+    strengthening_risk_rows,
+    strengthening_events,
+    naive_strengthening_rate,
+    state_strengthening_rate,
+    reduction_risk_rows,
+    reduction_events,
+    naive_reduction_rate,
+    state_reduction_rate
+  )
+
+knitr::kable(policy_comparison_selected)
+
+## I also calculate the same comparison at the domain level.
+## This is easier to read than the policy-level table.
+
+domain_comparison <- oxford_risk_set |>
+  dplyr::group_by(policy_domain) |>
+  dplyr::summarise(
+    observable_rows = sum(observable, na.rm = TRUE),
+    adoption_risk_rows = sum(risk_adoption, na.rm = TRUE),
+    adoption_events = sum(event_adoption, na.rm = TRUE),
+    strengthening_risk_rows = sum(risk_strengthening, na.rm = TRUE),
+    strengthening_events = sum(event_strengthening, na.rm = TRUE),
+    reduction_risk_rows = sum(risk_reduction, na.rm = TRUE),
+    reduction_events = sum(event_relaxation + event_termination, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+domain_comparison$naive_adoption_rate <- domain_comparison$adoption_events / domain_comparison$observable_rows
+domain_comparison$state_adoption_rate <- domain_comparison$adoption_events / domain_comparison$adoption_risk_rows
+
+domain_comparison$naive_strengthening_rate <- domain_comparison$strengthening_events / domain_comparison$observable_rows
+domain_comparison$state_strengthening_rate <- domain_comparison$strengthening_events / domain_comparison$strengthening_risk_rows
+
+domain_comparison$naive_reduction_rate <- domain_comparison$reduction_events / domain_comparison$observable_rows
+domain_comparison$state_reduction_rate <- domain_comparison$reduction_events / domain_comparison$reduction_risk_rows
+
+knitr::kable(domain_comparison)
+
+## A small summary table shows how much the denominator changes.
+
+denominator_change <- domain_comparison |>
+  dplyr::select(
+    policy_domain,
+    observable_rows,
+    adoption_risk_rows,
+    strengthening_risk_rows,
+    reduction_risk_rows
+  )
+
+denominator_change$adoption_risk_share <- denominator_change$adoption_risk_rows / denominator_change$observable_rows
+denominator_change$strengthening_risk_share <- denominator_change$strengthening_risk_rows / denominator_change$observable_rows
+denominator_change$reduction_risk_share <- denominator_change$reduction_risk_rows / denominator_change$observable_rows
+
+knitr::kable(denominator_change)
+
+```
+
+This comparison is the main proof-of-concept step before modelling. The same
+number of observed country-policy-days gives different denominators for
+adoption, strengthening, and reduction. This means that a simple pooled model
+would treat many logically ineligible rows as if they were at risk. The
+methodological point is that policy lifecycle events need state-dependent risk
+sets before peer exposure or covariates are interpreted.
+
+# Baseline model
+
+```{r baseline-model, message=FALSE, warning=FALSE}
+
+## I start with rollback/reduction as the first baseline outcome.
+## Reduction includes relaxation and termination.
+
+baseline_data <- oxford_risk_set
+
+baseline_data$reduction_event <- 0
+baseline_data$reduction_event[baseline_data$event_relaxation == 1] <- 1
+baseline_data$reduction_event[baseline_data$event_termination == 1] <- 1
+
+## Model 1 uses all observable rows.
+## This is the naive version because it treats all observed rows as the denominator.
+
+naive_data <- baseline_data |>
+  dplyr::filter(
+    observable == 1
+  )
+
+## Model 2 uses only rows where reduction is logically possible.
+## This is the state-dependent risk-set version.
+
+state_risk_data <- baseline_data |>
+  dplyr::filter(
+    risk_reduction == 1
+  )
+
+## There are many more non-events than events.
+## For this first baseline check, I keep all events and sample non-events.
+
+set.seed(123)
+
+naive_events <- naive_data |>
+  dplyr::filter(reduction_event == 1)
+
+naive_nonevents <- naive_data |>
+  dplyr::filter(reduction_event == 0)
+
+naive_nonevent_sample_size <- min(
+  nrow(naive_nonevents),
+  nrow(naive_events) * 20
+)
+
+naive_nonevents_sample <- naive_nonevents[
+  sample(1:nrow(naive_nonevents), naive_nonevent_sample_size),
+]
+
+naive_model_data <- dplyr::bind_rows(
+  naive_events,
+  naive_nonevents_sample
+)
+
+state_events <- state_risk_data |>
+  dplyr::filter(reduction_event == 1)
+
+state_nonevents <- state_risk_data |>
+  dplyr::filter(reduction_event == 0)
+
+state_nonevent_sample_size <- min(
+  nrow(state_nonevents),
+  nrow(state_events) * 20
+)
+
+state_nonevents_sample <- state_nonevents[
+  sample(1:nrow(state_nonevents), state_nonevent_sample_size),
+]
+
+state_model_data <- dplyr::bind_rows(
+  state_events,
+  state_nonevents_sample
+)
+
+## I fit simple logistic models.
+## This is not the final diffusion model yet.
+
+naive_model <- glm(
+  reduction_event ~ previous_value + policy_domain,
+  data = naive_model_data,
+  family = binomial()
+)
+
+state_model <- glm(
+  reduction_event ~ previous_value + policy_domain,
+  data = state_model_data,
+  family = binomial()
+)
+
+baseline_model_summary <- data.frame(
+  model = c("naive_observable_rows", "state_dependent_risk_set"),
+  rows = c(nrow(naive_model_data), nrow(state_model_data)),
+  events = c(sum(naive_model_data$reduction_event), sum(state_model_data$reduction_event)),
+  event_rate = c(mean(naive_model_data$reduction_event), mean(state_model_data$reduction_event)),
+  aic = c(AIC(naive_model), AIC(state_model))
+)
+
+knitr::kable(baseline_model_summary)
+
+## I also keep the coefficient tables so I can compare the two models.
+
+naive_coefficients <- as.data.frame(summary(naive_model)$coefficients)
+naive_coefficients$term <- rownames(naive_coefficients)
+naive_coefficients$model <- "naive_observable_rows"
+
+state_coefficients <- as.data.frame(summary(state_model)$coefficients)
+state_coefficients$term <- rownames(state_coefficients)
+state_coefficients$model <- "state_dependent_risk_set"
+
+baseline_coefficients <- dplyr::bind_rows(
+  naive_coefficients,
+  state_coefficients
+)
+
+baseline_coefficients <- baseline_coefficients |>
+  dplyr::select(
+    model,
+    term,
+    Estimate,
+    `Std. Error`,
+    `z value`,
+    `Pr(>|z|)`
+  )
+
+knitr::kable(baseline_coefficients)
+
+```
+
+The baseline model is still descriptive. It does not test diffusion exposure
+yet. Its purpose is to show whether the same rollback/reduction event looks
+different when the denominator is all observable rows versus the correct
+state-dependent reduction risk set.
