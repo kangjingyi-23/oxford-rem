@@ -1,0 +1,895 @@
+---
+title: "Annual Review Visualisation"
+author: "Jingyi Kang"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 11,
+  fig.height = 6,
+  out.width = "100%"
+)
+```
+
+<style>
+body { background: #0b111b; color: #eaf4ff; }
+.main-container { max-width: 1280px !important; }
+h1, h2, h3 { color: #f3f8ff; }
+table { color: #eaf4ff; }
+</style>
+
+# Aim
+
+This file makes the visual material for the annual review slides.
+
+The main point is simple: policy records can be turned into country-policy
+event structures. This is a data construction proof of concept, not a causal
+diffusion result.
+
+# Packages and paths
+
+```{r packages}
+packages <- c(
+  "dplyr", "readr", "stringr", "tidyr", "lubridate", "scales",
+  "ggplot2", "knitr", "visNetwork", "htmlwidgets", "magick"
+)
+
+missing_packages <- packages[!vapply(packages, requireNamespace, logical(1), quietly = TRUE)]
+
+if (length(missing_packages) > 0) {
+  stop("Install these packages first: ", paste(missing_packages, collapse = ", "))
+}
+
+library(dplyr)
+library(readr)
+library(stringr)
+library(tidyr)
+library(lubridate)
+library(scales)
+library(ggplot2)
+library(knitr)
+library(visNetwork)
+library(htmlwidgets)
+library(magick)
+```
+
+```{r paths}
+project_dir <- normalizePath(getwd(), winslash = "/", mustWork = FALSE)
+
+if (!file.exists(file.path(project_dir, "annual_review_visualization.Rmd"))) {
+  project_dir <- normalizePath(file.path(project_dir, "annual_review_visualization_project"), winslash = "/", mustWork = FALSE)
+}
+
+root_dir <- dirname(project_dir)
+annual_dir <- file.path(root_dir, "annual review")
+
+output_dir <- file.path(project_dir, "outputs", "rmd")
+plot_dir <- file.path(output_dir, "plots")
+widget_dir <- file.path(output_dir, "widgets")
+frame_dir <- file.path(output_dir, "frames")
+gif_dir <- file.path(output_dir, "gifs")
+ox_frame_dir <- file.path(frame_dir, "oxford_monthly")
+iea_frame_dir <- file.path(frame_dir, "iea_yearly")
+
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(widget_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(ox_frame_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(iea_frame_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(gif_dir, recursive = TRUE, showWarnings = FALSE)
+
+find_file <- function(file_name) {
+  hits <- list.files(
+    annual_dir,
+    pattern = paste0("^", file_name, "$"),
+    recursive = TRUE,
+    full.names = TRUE
+  )
+
+  if (length(hits) == 0) {
+    stop("Cannot find file: ", file_name)
+  }
+
+  normalizePath(hits[1], winslash = "/", mustWork = TRUE)
+}
+
+ox_event_file <- find_file("oxcgrt_event_sequence.csv")
+ox_counts_file <- find_file("poc1_event_counts.csv")
+iea_file <- find_file("iea_parsed_records.csv")
+iea_risk_file <- find_file("iea_risk_summary.csv")
+```
+
+# Shared code
+
+```{r shared-code}
+bg <- "#0b111b"
+main_text <- "#eaf4ff"
+muted_text <- "#9fb3c8"
+blue <- "#46c2ff"
+green <- "#8ef28f"
+orange <- "#ff6b4a"
+yellow <- "#f2c14e"
+grey <- "#9aa6b2"
+
+transition_colours <- c(
+  adoption = blue,
+  strengthening = green,
+  rollback_relaxation = orange,
+  relaxation = "#ff9f43",
+  termination = "#ff4d7d",
+  reduction = orange,
+  persistence = grey
+)
+
+iea_status_colours <- c(
+  in_force = green,
+  ended_by_2026 = orange,
+  future_or_target = yellow,
+  announced_or_other = grey
+)
+
+theme_dark <- function() {
+  theme_minimal(base_size = 13) +
+    theme(
+      plot.background = element_rect(fill = bg, colour = NA),
+      panel.background = element_rect(fill = bg, colour = NA),
+      panel.grid.major = element_line(colour = "#1d2a3b", linewidth = 0.25),
+      panel.grid.minor = element_blank(),
+      text = element_text(colour = main_text),
+      plot.title = element_text(face = "bold", size = 18, colour = "#f3f8ff"),
+      plot.subtitle = element_text(colour = muted_text),
+      axis.text = element_text(colour = "#b8c7d9"),
+      axis.title = element_text(colour = "#d8e8f7"),
+      legend.position = "bottom",
+      legend.title = element_blank(),
+      legend.text = element_text(colour = "#d8e8f7")
+    )
+}
+
+rank_metric <- function(x) {
+  if (length(unique(x)) <= 1) {
+    rep(1, length(x))
+  } else {
+    percent_rank(x)
+  }
+}
+
+rescale_safe <- function(x, to = c(0, 1)) {
+  if (length(unique(x[!is.na(x)])) <= 1) {
+    rep(mean(to), length(x))
+  } else {
+    rescale(x, to = to)
+  }
+}
+
+short_label <- function(x, width = 32) {
+  str_trunc(str_squish(x), width = width)
+}
+
+pretty_indicator <- function(x) {
+  x |>
+    str_replace("^C([0-9]+)E_", "C\\1: ") |>
+    str_replace("^H([0-9]+)E_", "H\\1: ") |>
+    str_replace("^H([0-9]+)_", "H\\1: ") |>
+    str_replace("^E([0-9]+)_", "E\\1: ") |>
+    str_replace_all("_", " ") |>
+    str_squish()
+}
+
+fix_country_name <- function(code, name) {
+  case_when(
+    code == "CHN" ~ "China",
+    code == "KOR" ~ "South Korea",
+    code == "RUS" ~ "Russia",
+    code == "USA" ~ "United States",
+    code == "GBR" ~ "United Kingdom",
+    TRUE ~ name
+  )
+}
+
+core_countries <- data.frame(
+  iso3 = c(
+    "USA", "GBR", "DEU", "FRA", "ITA", "ESP", "NLD", "SWE",
+    "CAN", "AUS", "NZL", "JPN", "KOR", "CHN", "IND", "BRA",
+    "ZAF", "MEX", "ARG", "IDN", "TUR", "RUS", "SAU"
+  )
+)
+
+clear_pngs <- function(folder) {
+  old_files <- list.files(folder, pattern = "\\.png$", full.names = TRUE)
+  if (length(old_files) > 0) unlink(old_files)
+}
+```
+
+# Oxford/OxCGRT
+
+## Load data
+
+```{r oxford-load}
+ox_events <- read_csv(ox_event_file, show_col_types = FALSE) |>
+  mutate(
+    Date = as.Date(Date),
+    month = floor_date(Date, "month"),
+    month_label = format(month, "%Y-%m"),
+    event_label = recode(
+      event,
+      adoption = "Adoption",
+      strengthening = "Strengthening",
+      rollback_relaxation = "Rollback / relaxation",
+      .default = event
+    )
+  )
+
+ox_counts <- read_csv(ox_counts_file, show_col_types = FALSE)
+
+ox_events |>
+  count(event, name = "events") |>
+  arrange(desc(events)) |>
+  kable(caption = "Oxford/OxCGRT transition counts")
+```
+
+## Choose countries and policy nodes
+
+```{r oxford-selection}
+ox_country_scores <- ox_events |>
+  semi_join(core_countries, by = c("CountryCode" = "iso3")) |>
+  group_by(CountryCode, CountryName) |>
+  summarise(
+    total_events = n(),
+    rollback_events = sum(event == "rollback_relaxation"),
+    domains = n_distinct(domain),
+    active_months = n_distinct(month_label),
+    event_types = n_distinct(event),
+    .groups = "drop"
+  ) |>
+  mutate(
+    score =
+      0.30 * rank_metric(total_events) +
+      0.30 * rank_metric(rollback_events) +
+      0.15 * rank_metric(domains) +
+      0.15 * rank_metric(active_months) +
+      0.10 * rank_metric(event_types)
+  ) |>
+  arrange(desc(score), desc(total_events))
+
+selected_ox_countries <- ox_country_scores |>
+  slice_head(n = 12)
+
+selected_ox_countries |>
+  select(CountryCode, CountryName, total_events, rollback_events, domains, active_months, score) |>
+  kable(digits = 3, caption = "Selected Oxford country nodes")
+
+ox_policy_scores <- ox_events |>
+  semi_join(selected_ox_countries, by = c("CountryCode", "CountryName")) |>
+  group_by(indicator, domain) |>
+  summarise(
+    total_events = n(),
+    countries = n_distinct(CountryCode),
+    rollback_events = sum(event == "rollback_relaxation"),
+    .groups = "drop"
+  ) |>
+  mutate(
+    score =
+      0.35 * rank_metric(total_events) +
+      0.25 * rank_metric(countries) +
+      0.30 * rank_metric(rollback_events) +
+      0.10 * rank_metric(total_events - rollback_events)
+  ) |>
+  arrange(desc(score), desc(total_events))
+
+selected_ox_policies <- ox_policy_scores |>
+  slice_head(n = 10)
+
+selected_ox_policies |>
+  select(indicator, domain, total_events, countries, rollback_events, score) |>
+  kable(digits = 3, caption = "Selected Oxford policy nodes")
+```
+
+## Count plot
+
+```{r oxford-count-plot}
+ox_count_plot <- ox_counts |>
+  filter(transition %in% c("adoption", "strengthening", "relaxation", "termination", "reduction")) |>
+  mutate(
+    transition = factor(
+      transition,
+      levels = c("adoption", "strengthening", "relaxation", "termination", "reduction")
+    )
+  ) |>
+  ggplot(aes(x = transition, y = state_dependent_events, fill = transition)) +
+  geom_col(width = 0.68) +
+  geom_text(
+    aes(label = comma(state_dependent_events)),
+    vjust = -0.35,
+    colour = main_text,
+    fontface = "bold",
+    size = 4
+  ) +
+  scale_fill_manual(values = transition_colours) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title = "Oxford/OxCGRT lifecycle transitions are observable",
+    subtitle = "Counts use the model-ready risk-set diagnostic coding.",
+    x = NULL,
+    y = "Observed events"
+  ) +
+  theme_dark()
+
+ox_count_plot
+
+ggsave(
+  file.path(plot_dir, "oxford_transition_counts.png"),
+  ox_count_plot,
+  width = 11,
+  height = 6,
+  dpi = 220
+)
+```
+
+## Interactive network
+
+```{r oxford-network}
+ox_country_nodes <- selected_ox_countries |>
+  mutate(
+    id = paste0("country_", CountryCode),
+    label = CountryName,
+    title = paste0(CountryName, "<br>Events: ", total_events, "<br>Rollback: ", rollback_events),
+    group = "Country",
+    shape = "dot",
+    color = blue,
+    size = 22 + rescale_safe(total_events, to = c(0, 14)),
+    x = 0,
+    y = seq(0, 650, length.out = n()),
+    fixed = TRUE
+  ) |>
+  select(id, label, title, group, shape, color, size, x, y, fixed)
+
+ox_policy_nodes <- selected_ox_policies |>
+  mutate(
+    id = paste0("policy_", make.names(indicator)),
+    label = pretty_indicator(indicator),
+    title = paste0(pretty_indicator(indicator), "<br>Events: ", total_events),
+    group = "Policy",
+    shape = "square",
+    color = green,
+    size = 22 + rescale_safe(total_events, to = c(0, 14)),
+    x = 900,
+    y = seq(0, 650, length.out = n()),
+    fixed = TRUE
+  ) |>
+  select(id, label, title, group, shape, color, size, x, y, fixed)
+
+ox_nodes <- bind_rows(ox_country_nodes, ox_policy_nodes)
+
+ox_edges <- ox_events |>
+  semi_join(selected_ox_countries, by = c("CountryCode", "CountryName")) |>
+  semi_join(selected_ox_policies, by = c("indicator", "domain")) |>
+  count(CountryCode, indicator, event, event_label, name = "weight") |>
+  mutate(
+    from = paste0("country_", CountryCode),
+    to = paste0("policy_", make.names(indicator)),
+    value = 1 + sqrt(weight),
+    color = unname(transition_colours[event]),
+    title = paste0(event_label, "<br>Events: ", weight)
+  ) |>
+  select(from, to, value, color, title)
+
+ox_widget <- visNetwork(ox_nodes, ox_edges, width = "100%", height = "680px", background = bg) |>
+  visNodes(font = list(color = main_text, size = 22), borderWidth = 2) |>
+  visEdges(smooth = list(enabled = TRUE, type = "cubicBezier", roundness = 0.35)) |>
+  visInteraction(hover = TRUE, navigationButtons = TRUE) |>
+  visPhysics(enabled = FALSE) |>
+  visLayout(randomSeed = 20260616)
+
+saveWidget(ox_widget, file.path(widget_dir, "oxford_two_mode_core_network.html"), selfcontained = TRUE)
+ox_widget
+```
+
+# Oxford animation
+
+```{r frame-helper}
+make_frame_plot <- function(country_layout, policy_layout, edge_data,
+                            colour_values, title, subtitle, stage_label, footnote) {
+  max_y <- max(c(country_layout$y, policy_layout$y))
+
+  p <- ggplot() +
+    annotate("rect", xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf, fill = bg) +
+    annotate("label", x = 0.91, y = max_y + 1.35, label = stage_label,
+             colour = "white", fill = "#111d2d", size = 5, fontface = "bold") +
+    annotate("text", x = 0.02, y = max_y + 0.35, label = "Core country nodes",
+             colour = blue, hjust = 0, fontface = "bold", size = 4.4) +
+    annotate("text", x = 0.73, y = max_y + 0.35, label = "Key policy nodes",
+             colour = green, hjust = 0, fontface = "bold", size = 4.4)
+
+  if (nrow(edge_data) > 0) {
+    p <- p +
+      geom_curve(
+        data = edge_data,
+        aes(
+          x = country_x, y = country_y,
+          xend = policy_x, yend = policy_y,
+          colour = edge_type,
+          linewidth = edge_width,
+          alpha = edge_alpha
+        ),
+        curvature = 0.12,
+        ncp = 12,
+        lineend = "round"
+      )
+  }
+
+  p +
+    geom_point(data = country_layout, aes(x = x, y = y, size = node_size),
+               shape = 21, fill = blue, colour = "#d9f2ff", stroke = 0.35) +
+    geom_text(data = country_layout, aes(x = x - 0.055, y = y, label = label),
+              colour = "#d8e8f7", hjust = 1, size = 3.55) +
+    geom_point(data = policy_layout, aes(x = x, y = y, size = node_size),
+               shape = 22, fill = green, colour = "#e6ffe8", stroke = 0.35) +
+    geom_text(data = policy_layout, aes(x = x + 0.018, y = y, label = label),
+              colour = "#d8e8f7", hjust = 0, size = 3.25) +
+    scale_colour_manual(values = colour_values, drop = FALSE) +
+    scale_alpha_identity() +
+    scale_linewidth_identity() +
+    scale_size_identity() +
+    coord_cartesian(xlim = c(0, 1), ylim = c(-0.1, max_y + 1.55), clip = "off") +
+    labs(title = title, subtitle = subtitle, caption = footnote) +
+    guides(colour = guide_legend(title = NULL, override.aes = list(linewidth = 3, alpha = 1))) +
+    theme_void(base_size = 12) +
+    theme(
+      plot.background = element_rect(fill = bg, colour = NA),
+      panel.background = element_rect(fill = bg, colour = NA),
+      plot.title = element_text(colour = "#f3f8ff", face = "bold", size = 26),
+      plot.subtitle = element_text(colour = muted_text, size = 14),
+      plot.caption = element_text(colour = muted_text, hjust = 0, size = 8),
+      legend.position = "bottom",
+      legend.text = element_text(colour = "#d8e8f7", size = 9),
+      legend.key = element_rect(fill = bg, colour = NA),
+      legend.background = element_rect(fill = bg, colour = NA),
+      plot.margin = margin(18, 34, 18, 34)
+    )
+}
+
+save_frame <- function(plot, file_name) {
+  ggsave(file_name, plot, width = 12.8, height = 7.2, dpi = 150, bg = bg)
+  file_name
+}
+
+make_gif <- function(frame_files, gif_file, fps = 4) {
+  image_read(frame_files) |>
+    image_animate(fps = fps, loop = 0) |>
+    image_write(gif_file)
+
+  gif_file
+}
+```
+
+```{r oxford-animation}
+clear_pngs(ox_frame_dir)
+
+ox_frame_colours <- c(
+  "Adoption" = blue,
+  "Strengthening" = green,
+  "Rollback / relaxation" = orange
+)
+
+ox_country_layout <- selected_ox_countries |>
+  mutate(
+    label = short_label(CountryName, 24),
+    x = 0.17,
+    y = rev(seq_len(n())),
+    node_size = 3.2 + rescale_safe(total_events, to = c(0, 1.4))
+  ) |>
+  select(CountryCode, label, x, y, node_size)
+
+ox_policy_layout <- selected_ox_policies |>
+  mutate(
+    label = short_label(pretty_indicator(indicator), 34),
+    x = 0.78,
+    y = rev(seq_len(n())),
+    node_size = 3.2 + rescale_safe(total_events, to = c(0, 1.4))
+  ) |>
+  select(indicator, label, x, y, node_size)
+
+ox_monthly_edges <- ox_events |>
+  semi_join(selected_ox_countries, by = c("CountryCode", "CountryName")) |>
+  semi_join(selected_ox_policies, by = c("indicator", "domain")) |>
+  count(month, month_label, CountryCode, indicator, event, event_label, name = "weight")
+
+get_ox_edges <- function(this_month) {
+  ox_monthly_edges |>
+    filter(month <= this_month) |>
+    group_by(CountryCode, indicator, event, event_label) |>
+    summarise(
+      weight = sum(weight),
+      current_weight = sum(if_else(month == this_month, weight, 0L)),
+      .groups = "drop"
+    ) |>
+    left_join(ox_country_layout |> select(CountryCode, country_x = x, country_y = y), by = "CountryCode") |>
+    left_join(ox_policy_layout |> select(indicator, policy_x = x, policy_y = y), by = "indicator") |>
+    mutate(
+      edge_type = factor(event_label, levels = names(ox_frame_colours)),
+      edge_width = pmin(3.1, 0.22 + sqrt(weight) * 0.32),
+      edge_alpha = case_when(
+        current_weight > 0 ~ 0.86,
+        event == "rollback_relaxation" ~ 0.34,
+        TRUE ~ 0.20
+      )
+    )
+}
+
+ox_months <- sort(unique(ox_monthly_edges$month))
+
+ox_frame_index <- data.frame(
+  month = ox_months,
+  label = format(ox_months, "%Y-%m"),
+  file = file.path(ox_frame_dir, paste0("oxford_month_", format(ox_months, "%Y_%m"), ".png"))
+)
+
+ox_frames <- character(nrow(ox_frame_index))
+
+for (i in seq_len(nrow(ox_frame_index))) {
+  this_month <- ox_frame_index$month[i]
+  plot_data <- get_ox_edges(this_month)
+
+  p <- make_frame_plot(
+    ox_country_layout,
+    ox_policy_layout,
+    plot_data,
+    ox_frame_colours,
+    "Oxford/OxCGRT: policy-event structure",
+    "Each frame is generated from monthly country-policy transition counts.",
+    ox_frame_index$label[i],
+    "Left-side countries are selected key country nodes from the full dataset; right-side nodes show key policy indicators."
+  )
+
+  ox_frames[i] <- save_frame(p, ox_frame_index$file[i])
+}
+
+ox_gif <- make_gif(ox_frames, file.path(gif_dir, "oxford_monthly_two_mode_rmd.gif"), fps = 4)
+
+kable(ox_frame_index, caption = "Oxford frame files")
+```
+
+```{r oxford-gif-preview, echo=FALSE}
+knitr::include_graphics(ox_gif)
+```
+
+# IEA
+
+## Load data
+
+```{r iea-load}
+iea_records <- read_csv(iea_file, show_col_types = FALSE) |>
+  mutate(
+    national = as.logical(national),
+    ended_by_2026 = as.logical(ended_by_2026),
+    start_year = suppressWarnings(as.integer(start_year)),
+    end_year = suppressWarnings(as.integer(end_year)),
+    policy_family = if_else(is.na(policy_family) | policy_family == "", "Unclassified", policy_family),
+    edge_status = case_when(
+      status == "Ended" & ended_by_2026 ~ "ended_by_2026",
+      !is.na(end_year) & end_year > 2026 ~ "future_or_target",
+      status == "In force" ~ "in_force",
+      TRUE ~ "announced_or_other"
+    )
+  )
+
+iea_risk <- read_csv(iea_risk_file, show_col_types = FALSE)
+
+iea_risk |>
+  kable(caption = "IEA risk summary")
+```
+
+## Choose countries and policy nodes
+
+```{r iea-selection}
+iea_country_scores <- iea_records |>
+  filter(national %in% c(TRUE, NA)) |>
+  semi_join(core_countries, by = c("iso3" = "iso3")) |>
+  group_by(iso3, country_name) |>
+  summarise(
+    records = n(),
+    ended_records = sum(edge_status == "ended_by_2026", na.rm = TRUE),
+    in_force_records = sum(edge_status == "in_force", na.rm = TRUE),
+    policy_families = n_distinct(policy_family[policy_family != "Unclassified"]),
+    first_year = suppressWarnings(min(start_year, na.rm = TRUE)),
+    last_year = suppressWarnings(max(start_year, na.rm = TRUE)),
+    .groups = "drop"
+  ) |>
+  mutate(
+    year_span = if_else(is.finite(first_year) & is.finite(last_year), last_year - first_year + 1L, 0L),
+    score =
+      0.35 * rank_metric(records) +
+      0.25 * rank_metric(policy_families) +
+      0.25 * rank_metric(ended_records) +
+      0.15 * rank_metric(year_span),
+    display_country = fix_country_name(iso3, country_name)
+  ) |>
+  arrange(desc(score), desc(records))
+
+selected_iea_countries <- iea_country_scores |>
+  slice_head(n = 12)
+
+selected_iea_countries |>
+  select(iso3, display_country, records, policy_families, ended_records, year_span, score) |>
+  kable(digits = 3, caption = "Selected IEA country nodes")
+
+iea_family_scores <- iea_records |>
+  semi_join(selected_iea_countries, by = c("iso3", "country_name")) |>
+  filter(policy_family != "Unclassified") |>
+  group_by(policy_family) |>
+  summarise(
+    records = n(),
+    countries = n_distinct(iso3),
+    ended_records = sum(edge_status == "ended_by_2026", na.rm = TRUE),
+    in_force_records = sum(edge_status == "in_force", na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    score =
+      0.35 * rank_metric(records) +
+      0.25 * rank_metric(countries) +
+      0.25 * rank_metric(ended_records) +
+      0.15 * rank_metric(in_force_records)
+  ) |>
+  arrange(desc(score), desc(records))
+
+selected_iea_families <- iea_family_scores |>
+  slice_head(n = 10)
+
+selected_iea_families |>
+  select(policy_family, records, countries, ended_records, in_force_records, score) |>
+  kable(digits = 3, caption = "Selected IEA policy-family nodes")
+```
+
+## Status plot
+
+```{r iea-status-plot}
+iea_status_plot <- iea_records |>
+  filter(iso3 %in% selected_iea_countries$iso3) |>
+  count(edge_status, name = "records") |>
+  mutate(
+    edge_status = factor(
+      edge_status,
+      levels = c("in_force", "ended_by_2026", "future_or_target", "announced_or_other")
+    ),
+    label = recode(
+      as.character(edge_status),
+      in_force = "In force",
+      ended_by_2026 = "Ended by 2026",
+      future_or_target = "Future/target end",
+      announced_or_other = "Announced/other"
+    )
+  ) |>
+  ggplot(aes(x = label, y = records, fill = edge_status)) +
+  geom_col(width = 0.68) +
+  geom_text(aes(label = comma(records)), vjust = -0.35, colour = main_text, fontface = "bold", size = 4) +
+  scale_fill_manual(values = iea_status_colours, drop = FALSE) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title = "IEA records support a policy-spell view",
+    subtitle = "End years need cleaning before they can be interpreted as rollback.",
+    x = NULL,
+    y = "Policy records"
+  ) +
+  theme_dark() +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+
+iea_status_plot
+
+ggsave(
+  file.path(plot_dir, "iea_status_counts_core_countries.png"),
+  iea_status_plot,
+  width = 11,
+  height = 6,
+  dpi = 220
+)
+```
+
+## Interactive network
+
+```{r iea-network}
+iea_country_nodes <- selected_iea_countries |>
+  mutate(
+    id = paste0("country_", iso3),
+    label = display_country,
+    title = paste0(display_country, "<br>Records: ", records, "<br>Ended: ", ended_records),
+    group = "Country",
+    shape = "dot",
+    color = blue,
+    size = 22 + rescale_safe(records, to = c(0, 14)),
+    x = 0,
+    y = seq(0, 650, length.out = n()),
+    fixed = TRUE
+  ) |>
+  select(id, label, title, group, shape, color, size, x, y, fixed)
+
+iea_policy_nodes <- selected_iea_families |>
+  mutate(
+    id = paste0("family_", make.names(policy_family)),
+    label = str_wrap(policy_family, width = 28),
+    title = paste0(policy_family, "<br>Records: ", records),
+    group = "Policy family",
+    shape = "square",
+    color = green,
+    size = 22 + rescale_safe(records, to = c(0, 14)),
+    x = 900,
+    y = seq(0, 650, length.out = n()),
+    fixed = TRUE
+  ) |>
+  select(id, label, title, group, shape, color, size, x, y, fixed)
+
+iea_nodes <- bind_rows(iea_country_nodes, iea_policy_nodes)
+
+iea_edges <- iea_records |>
+  semi_join(selected_iea_countries, by = c("iso3", "country_name")) |>
+  semi_join(selected_iea_families, by = "policy_family") |>
+  count(iso3, policy_family, edge_status, name = "weight") |>
+  mutate(
+    from = paste0("country_", iso3),
+    to = paste0("family_", make.names(policy_family)),
+    value = 1 + sqrt(weight),
+    color = unname(iea_status_colours[edge_status]),
+    status_priority = case_when(
+      edge_status == "ended_by_2026" ~ 4,
+      edge_status == "future_or_target" ~ 3,
+      edge_status == "in_force" ~ 2,
+      TRUE ~ 1
+    ),
+    title = paste0(edge_status, "<br>Records: ", weight)
+  ) |>
+  group_by(from, to) |>
+  arrange(desc(status_priority), desc(weight), .by_group = TRUE) |>
+  slice_head(n = 2) |>
+  ungroup() |>
+  arrange(desc(status_priority), desc(weight)) |>
+  slice_head(n = 80) |>
+  select(from, to, value, color, title)
+
+iea_widget <- visNetwork(iea_nodes, iea_edges, width = "100%", height = "680px", background = bg) |>
+  visNodes(font = list(color = main_text, size = 22), borderWidth = 2) |>
+  visEdges(smooth = list(enabled = TRUE, type = "cubicBezier", roundness = 0.35)) |>
+  visInteraction(hover = TRUE, navigationButtons = TRUE) |>
+  visPhysics(enabled = FALSE) |>
+  visLayout(randomSeed = 20260616)
+
+saveWidget(iea_widget, file.path(widget_dir, "iea_two_mode_core_network.html"), selfcontained = TRUE)
+iea_widget
+```
+
+# IEA animation
+
+```{r iea-animation}
+clear_pngs(iea_frame_dir)
+
+iea_frame_colours <- c(
+  "In force" = green,
+  "Ended by 2026" = orange,
+  "Future/target end" = yellow,
+  "Announced/other" = grey
+)
+
+iea_country_layout <- selected_iea_countries |>
+  mutate(
+    label = short_label(display_country, 24),
+    x = 0.17,
+    y = rev(seq_len(n())),
+    node_size = 3.2 + rescale_safe(records, to = c(0, 1.4))
+  ) |>
+  select(iso3, label, x, y, node_size)
+
+iea_policy_layout <- selected_iea_families |>
+  mutate(
+    label = short_label(policy_family, 34),
+    x = 0.78,
+    y = rev(seq_len(n())),
+    node_size = 3.2 + rescale_safe(records, to = c(0, 1.4))
+  ) |>
+  select(policy_family, label, x, y, node_size)
+
+iea_yearly_edges <- iea_records |>
+  semi_join(selected_iea_countries, by = c("iso3", "country_name")) |>
+  semi_join(selected_iea_families, by = "policy_family") |>
+  filter(!is.na(start_year), start_year <= 2026) |>
+  mutate(
+    edge_label = recode(
+      edge_status,
+      in_force = "In force",
+      ended_by_2026 = "Ended by 2026",
+      future_or_target = "Future/target end",
+      announced_or_other = "Announced/other"
+    )
+  ) |>
+  count(start_year, iso3, policy_family, edge_status, edge_label, name = "weight")
+
+get_iea_edges <- function(this_year) {
+  iea_yearly_edges |>
+    filter(start_year <= this_year) |>
+    group_by(iso3, policy_family, edge_status, edge_label) |>
+    summarise(
+      weight = sum(weight),
+      current_weight = sum(if_else(start_year == this_year, weight, 0L)),
+      .groups = "drop"
+    ) |>
+    left_join(iea_country_layout |> select(iso3, country_x = x, country_y = y), by = "iso3") |>
+    left_join(iea_policy_layout |> select(policy_family, policy_x = x, policy_y = y), by = "policy_family") |>
+    mutate(
+      offset = case_when(
+        edge_status == "ended_by_2026" ~ 0.075,
+        edge_status == "future_or_target" ~ 0.025,
+        edge_status == "in_force" ~ -0.025,
+        TRUE ~ -0.075
+      ),
+      country_y = country_y + offset,
+      policy_y = policy_y + offset,
+      edge_type = factor(edge_label, levels = names(iea_frame_colours)),
+      edge_width = pmin(3.1, 0.22 + sqrt(weight) * 0.28),
+      edge_alpha = case_when(
+        current_weight > 0 ~ 0.86,
+        edge_status == "ended_by_2026" ~ 0.38,
+        TRUE ~ 0.22
+      )
+    )
+}
+
+iea_years <- seq(min(iea_yearly_edges$start_year), max(iea_yearly_edges$start_year), by = 1)
+
+iea_frame_index <- data.frame(
+  year = iea_years,
+  file = file.path(iea_frame_dir, paste0("iea_year_", iea_years, ".png"))
+)
+
+iea_frames <- character(nrow(iea_frame_index))
+
+for (i in seq_len(nrow(iea_frame_index))) {
+  this_year <- iea_frame_index$year[i]
+  plot_data <- get_iea_edges(this_year)
+
+  p <- make_frame_plot(
+    iea_country_layout,
+    iea_policy_layout,
+    plot_data,
+    iea_frame_colours,
+    "IEA: policy-record structure",
+    "Each frame is generated from cumulative country-policy-family records by start year.",
+    as.character(this_year),
+    "Left-side countries are selected key country nodes from the full dataset; right-side nodes show key policy families."
+  )
+
+  iea_frames[i] <- save_frame(p, iea_frame_index$file[i])
+}
+
+iea_gif <- make_gif(iea_frames, file.path(gif_dir, "iea_yearly_two_mode_rmd.gif"), fps = 4)
+
+kable(iea_frame_index, caption = "IEA frame files")
+```
+
+```{r iea-gif-preview, echo=FALSE}
+knitr::include_graphics(iea_gif)
+```
+
+# Outputs
+
+The main files written by this Rmd are:
+
+- `outputs/rmd/plots/oxford_transition_counts.png`
+- `outputs/rmd/plots/iea_status_counts_core_countries.png`
+- `outputs/rmd/widgets/oxford_two_mode_core_network.html`
+- `outputs/rmd/widgets/iea_two_mode_core_network.html`
+- `outputs/rmd/frames/oxford_monthly/*.png`
+- `outputs/rmd/frames/iea_yearly/*.png`
+- `outputs/rmd/gifs/oxford_monthly_two_mode_rmd.gif`
+- `outputs/rmd/gifs/iea_yearly_two_mode_rmd.gif`
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
